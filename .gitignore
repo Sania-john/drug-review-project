@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.vscode/
+.DS_Store
+
+# Dataset: download from Kaggle instead (see README)
+drug review dataset.csv
+drugsCom*.csv
+drugsCom*.tsv
