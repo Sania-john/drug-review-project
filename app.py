@@ -52,10 +52,13 @@ st.markdown(
 # ----------------------- File locations ----------------------
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATASET_CANDIDATES = [
+    PROJECT_DIR / "drug_reviews_processed.csv",
+    PROJECT_DIR / "powerbi_data" / "drug_reviews_processed.csv",
     PROJECT_DIR / "drug review dataset.csv",
     PROJECT_DIR / "drug_review_dataset.csv",
     PROJECT_DIR / "powerbi_data" / "drug review dataset.csv",
     PROJECT_DIR / "powerbi_data" / "drug_review_dataset.csv",
+    Path.home() / "Downloads" / "drug_reviews_processed.csv",
     Path.home() / "Downloads" / "drug review dataset.csv",
 ]
 DEFAULT_PBIX_CANDIDATES = [
@@ -119,10 +122,27 @@ def load_raw_dataset(path_string, modified_time):
     # modified_time participates in the cache key so file updates reload.
     del modified_time
     frame = pd.read_csv(path_string, low_memory=False)
+    # Accept both the original Drug Review dataset and the CSV exported from Colab.
+    frame.columns = [str(column).strip() for column in frame.columns]
+    lower_to_original = {column.lower(): column for column in frame.columns}
+    aliases = {
+        "drug": "drugName",
+        "drugname": "drugName",
+        "condition": "condition",
+        "review": "review",
+        "rating": "rating",
+    }
+    rename_map = {}
+    for lower_name, target_name in aliases.items():
+        if lower_name in lower_to_original and target_name not in frame.columns:
+            rename_map[lower_to_original[lower_name]] = target_name
+    if rename_map:
+        frame = frame.rename(columns=rename_map)
     required = {"drugName", "condition", "review", "rating"}
     if not required.issubset(frame.columns):
         raise ValueError(
-            "CSV must contain these columns: drugName, condition, review, rating."
+            "CSV must contain drug/drugName, condition, review, and rating columns. "
+            f"Found: {', '.join(map(str, frame.columns))}"
         )
     frame["drugName"] = frame["drugName"].fillna("").astype(str).str.strip()
     frame["condition"] = frame["condition"].fillna("").astype(str).str.strip()
@@ -260,6 +280,71 @@ if side_effect_compare_path:
         # Keep the locally calculated comparison if the optional export is malformed.
         pass
 
+
+# ---------------------- Local Spark outputs -------------------
+SPARK_OUTPUT_DIR = PROJECT_DIR / "spark_output"
+SPARK_OUTPUT_CANDIDATES = {
+    "drug_summary": [
+        SPARK_OUTPUT_DIR / "drug_summary.csv",
+        PROJECT_DIR / "drug_summary.csv",
+    ],
+    "side_effect_counts": [
+        SPARK_OUTPUT_DIR / "side_effect_counts.csv",
+        PROJECT_DIR / "side_effect_counts.csv",
+    ],
+    "low_rating_side_effects": [
+        SPARK_OUTPUT_DIR / "low_rating_side_effects.csv",
+        PROJECT_DIR / "low_rating_side_effects.csv",
+    ],
+    "drug_side_effects": [
+        SPARK_OUTPUT_DIR / "drug_side_effects.csv",
+        PROJECT_DIR / "drug_side_effects.csv",
+    ],
+}
+
+
+@st.cache_data(show_spinner="Loading Spark analytics outputs...")
+def load_spark_csv(path_string, modified_time):
+    del modified_time
+    return pd.read_csv(path_string, low_memory=False)
+
+
+def get_spark_output(key):
+    path = first_existing(SPARK_OUTPUT_CANDIDATES[key])
+    if path is None:
+        return pd.DataFrame(), None
+    try:
+        frame = load_spark_csv(str(path), path.stat().st_mtime)
+        frame.columns = [str(column).strip().lower() for column in frame.columns]
+        return frame, path
+    except Exception as exc:
+        return pd.DataFrame(), f"ERROR: {exc}"
+
+
+spark_drug_summary, spark_summary_path = get_spark_output("drug_summary")
+spark_effect_counts, spark_effect_path = get_spark_output("side_effect_counts")
+spark_low_effects, spark_low_effect_path = get_spark_output("low_rating_side_effects")
+spark_drug_effects, spark_drug_effect_path = get_spark_output("drug_side_effects")
+
+
+def normalize_spark_columns():
+    # Coerce numeric output columns and normalize text columns for reliable charts.
+    for frame, numeric_cols, text_cols in [
+        (spark_drug_summary, ["avg_rating", "review_count"], ["condition", "drug"]),
+        (spark_effect_counts, ["reviews", "mentions", "count"], ["term"]),
+        (spark_low_effects, ["reviews", "mentions", "count"], ["term"]),
+        (spark_drug_effects, ["reviews", "mentions", "count"], ["drug", "term"]),
+    ]:
+        for col in numeric_cols:
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        for col in text_cols:
+            if col in frame.columns:
+                frame[col] = frame[col].fillna("").astype(str).str.strip()
+
+
+normalize_spark_columns()
+
 # ----------------------- Sidebar navigation -------------------
 st.sidebar.markdown("# 🧬 DrugLens AI")
 st.sidebar.caption("BIG DATA INTELLIGENCE PLATFORM")
@@ -269,6 +354,7 @@ page = st.sidebar.radio(
     "NAVIGATION",
     [
         "Overview",
+        "Spark Processing",
         "Drug Explorer",
         "Side-Effect Intelligence",
         "Power BI Dashboard",
@@ -288,7 +374,7 @@ if dataset_path:
 else:
     st.sidebar.warning("Review CSV not found")
 
-st.sidebar.caption("Python • Pandas • MongoDB • MapReduce • Power BI")
+st.sidebar.caption("Google Colab / Spark • Python • Pandas • MongoDB • Power BI")
 
 # ---------------------------- Header --------------------------
 st.markdown(
@@ -298,6 +384,143 @@ st.markdown(
 st.title("DrugLens AI")
 st.markdown("Explore drug reviews. Discover patterns. Understand feedback.")
 st.divider()
+
+# ---------------------- Spark Processing ----------------------
+if page == "Spark Processing":
+    st.subheader("⚡ Local PySpark Analytics")
+    st.markdown(
+        "This page displays the CSV outputs generated by `spark_jobs.py`. "
+        "Run the Spark job first; the dashboard reads the saved results from `spark_output/`."
+    )
+
+    spark_frames = [
+        ("Drug summary", spark_drug_summary, spark_summary_path),
+        ("Side-effect counts", spark_effect_counts, spark_effect_path),
+        ("Low-rating side effects", spark_low_effects, spark_low_effect_path),
+        ("Drug / side-effect pairs", spark_drug_effects, spark_drug_effect_path),
+    ]
+    present_count = sum(not frame.empty for _, frame, _ in spark_frames)
+    if present_count:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Spark output tables", f"{present_count}/4")
+        m2.metric("Drug-condition pairs", f"{len(spark_drug_summary):,}")
+        m3.metric(
+            "Side-effect terms",
+            f"{spark_effect_counts['term'].nunique():,}" if "term" in spark_effect_counts.columns else "N/A",
+        )
+        m4.metric("Drug-effect pairs", f"{len(spark_drug_effects):,}")
+        st.caption(f"Spark output directory: `{SPARK_OUTPUT_DIR}`")
+
+        if not spark_drug_summary.empty:
+            st.markdown("### ⭐ Drug rating summary")
+            if {"drug", "condition", "avg_rating"}.issubset(spark_drug_summary.columns):
+                summary_view = spark_drug_summary.copy()
+                condition_values = sorted(summary_view["condition"].replace("", pd.NA).dropna().unique().tolist())
+                selected_spark_condition = st.selectbox(
+                    "Filter Spark summary by condition",
+                    ["All conditions"] + condition_values,
+                    key="spark_condition_filter",
+                )
+                if selected_spark_condition != "All conditions":
+                    summary_view = summary_view[summary_view["condition"] == selected_spark_condition]
+                if not summary_view.empty:
+                    top_spark = summary_view.nlargest(10, "avg_rating")
+                    fig = px.bar(
+                        top_spark.sort_values("avg_rating"),
+                        x="avg_rating", y="drug", orientation="h",
+                        color="avg_rating",
+                        hover_data=[c for c in ["condition", "review_count"] if c in top_spark.columns],
+                        title="Top 10 Average-Rated Drug Entries",
+                        labels={"avg_rating": "Average rating", "drug": "Drug"},
+                        color_continuous_scale=["#7c3aed", "#22d3ee"],
+                    )
+                    fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+                    st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(summary_view, use_container_width=True)
+            else:
+                st.warning("drug_summary.csv must contain condition, drug, and avg_rating columns.")
+
+        if not spark_effect_counts.empty and "term" in spark_effect_counts.columns:
+            st.markdown("### 🧪 Most-mentioned side-effect terms")
+            effect_count_col = next((c for c in ["reviews", "mentions", "count"] if c in spark_effect_counts.columns), None)
+            if effect_count_col:
+                top_effects = spark_effect_counts.nlargest(15, effect_count_col).sort_values(effect_count_col)
+                fig = px.bar(
+                    top_effects, x=effect_count_col, y="term", orientation="h",
+                    title="Top Side-Effect Keyword Mentions (Spark)",
+                    labels={effect_count_col: "Reviews / mentions", "term": "Term"},
+                    color=effect_count_col, color_continuous_scale=["#7c3aed", "#22d3ee"],
+                )
+                fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+                st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(spark_effect_counts, use_container_width=True)
+
+        if not spark_low_effects.empty and "term" in spark_low_effects.columns:
+            st.markdown("### ⚠️ Side effects in low-rated reviews (rating ≤ 4)")
+            low_count_col = next((c for c in ["reviews", "mentions", "count"] if c in spark_low_effects.columns), None)
+            if low_count_col:
+                low_view = spark_low_effects.nlargest(15, low_count_col).sort_values(low_count_col)
+                fig = px.bar(
+                    low_view, x=low_count_col, y="term", orientation="h",
+                    title="Most-mentioned Terms in Low-rated Reviews",
+                    labels={low_count_col: "Low-rated reviews / mentions", "term": "Term"},
+                    color=low_count_col, color_continuous_scale=["#be123c", "#f9a8d4"],
+                )
+                fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+                st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(spark_low_effects, use_container_width=True)
+
+        if not spark_drug_effects.empty:
+            st.markdown("### 🔬 Drug-specific side-effect terms")
+            if {"drug", "term"}.issubset(spark_drug_effects.columns):
+                drug_names = sorted(spark_drug_effects["drug"].replace("", pd.NA).dropna().unique().tolist())
+                selected_spark_drug = st.selectbox(
+                    "Select a drug to inspect keyword mentions",
+                    ["All drugs"] + drug_names,
+                    key="spark_drug_effect_filter",
+                )
+                drug_effect_view = spark_drug_effects.copy()
+                if selected_spark_drug != "All drugs":
+                    drug_effect_view = drug_effect_view[drug_effect_view["drug"] == selected_spark_drug]
+                count_col = next((c for c in ["reviews", "mentions", "count"] if c in drug_effect_view.columns), None)
+                if count_col and not drug_effect_view.empty:
+                    plot_view = drug_effect_view.nlargest(15, count_col).sort_values(count_col)
+                    fig = px.bar(
+                        plot_view, x=count_col, y="term", orientation="h",
+                        title="Side-effect keywords by drug",
+                        labels={count_col: "Reviews / mentions", "term": "Term"},
+                        color=count_col, color_continuous_scale=["#2563eb", "#22d3ee"],
+                    )
+                    fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+                    st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(drug_effect_view, use_container_width=True)
+
+        for label, frame, path in spark_frames:
+            if isinstance(path, str) and path.startswith("ERROR:"):
+                st.error(f"{label}: {path}")
+
+        st.download_button(
+            "Download Spark drug summary",
+            data=spark_drug_summary.to_csv(index=False).encode("utf-8"),
+            file_name="drug_summary.csv",
+            mime="text/csv",
+            disabled=spark_drug_summary.empty,
+        )
+    else:
+        st.warning("No Spark output CSVs were found yet.")
+        st.code(
+            '$env:JAVA_HOME = "$env:LOCALAPPDATA\\Programs\\Eclipse Adoptium\\jdk-21.0.12.101-hotspot"\n'
+            '$env:Path = "$env:JAVA_HOME\\bin;$env:Path"\n'
+            '$env:PYTHONHASHSEED = "0"\n'
+            "python spark_jobs.py",
+            language="powershell",
+        )
+        st.info(
+            "After the job completes, check that `spark_output` contains "
+            "`drug_summary.csv`, `side_effect_counts.csv`, "
+            "`low_rating_side_effects.csv`, and `drug_side_effects.csv`, "
+            "then refresh this Streamlit page."
+        )
 
 # -------------------------- Overview --------------------------
 if page == "Overview":
