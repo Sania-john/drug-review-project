@@ -8,3 +8,6 @@ __pycache__/
 drug review dataset.csv
 drugsCom*.csv
 drugsCom*.tsv
+reviews_clean.tsv
+drug_reviews_processed.csv
+spark_error.txt
